@@ -56,6 +56,15 @@ def segment_ids_strategy(draw, seq_len: int) -> splash.SegmentIds:
   return splash.SegmentIds(ids_array, ids_array)
 
 
+@hps.composite
+def segment_mask_function_strategy(draw, max_seg_id: int) -> splash.SegmentMaskFunctionType:
+  equals = lambda q_seg, kv_seg: kv_seg == q_seg
+  gt = lambda q_seg, kv_seg: kv_seg >= q_seg
+  fancy = lambda q_seg, kv_seg: (kv_seg == q_seg) | (kv_seg == 0)
+
+  return draw(hps.sampled_from([equals, gt, fancy]))
+
+
 def seed_strategy() -> hps.SearchStrategy[int]:
   return hps.integers(min_value=0, max_value=4)
 
@@ -367,9 +376,11 @@ class SplashAttentionTest(PallasBaseTest):
       )
 
     segment_ids = None
+    segment_mask_function = None
     if is_segmented:
       assert q_seq_len == kv_seq_len
       segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+      segment_mask_function = data.draw(segment_mask_function_strategy(jnp.max(segment_ids.q)))
 
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     masks = data.draw(mha_mask_strategy(q_seq_len, kv_seq_len, num_q_heads))
@@ -379,17 +390,19 @@ class SplashAttentionTest(PallasBaseTest):
     block_sizes = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
 
     if is_mqa:
-      attn_ref = splash.make_masked_mqa_reference(mask)
+      attn_ref = splash.make_masked_mqa_reference(mask, segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mqa_single_device(
           mask,
+          segment_mask_function=segment_mask_function,
           block_sizes=block_sizes,
           attn_logits_soft_cap=attn_logits_soft_cap,
           interpret=self.INTERPRET,
       )
     else:
-      attn_ref = splash.make_masked_mha_reference(mask)
+      attn_ref = splash.make_masked_mha_reference(mask, segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mha_single_device(
           mask,
+          segment_mask_function=segment_mask_function,
           block_sizes=block_sizes,
           attn_logits_soft_cap=attn_logits_soft_cap,
           interpret=self.INTERPRET,
@@ -444,9 +457,12 @@ class SplashAttentionTest(PallasBaseTest):
       )
 
     segment_ids = None
+    segment_mask_function = None
     if is_segmented:
       assert q_seq_len == kv_seq_len
       segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+      segment_mask_function = data.draw(segment_mask_function_strategy(jnp.max(segment_ids.q)))
+
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     masks = data.draw(mha_mask_strategy(q_seq_len, kv_seq_len, num_q_heads))
     mask = mask_lib.MultiHeadMask(tuple(m.get_mask() for m in masks))
@@ -454,18 +470,20 @@ class SplashAttentionTest(PallasBaseTest):
       mask = jnp.array(mask[:, :, :])
     block_sizes = data.draw(block_sizes_strategy(q_seq_len, kv_seq_len))
     if is_mqa:
-      attn_ref = splash.make_masked_mqa_reference(mask)
+      attn_ref = splash.make_masked_mqa_reference(mask, segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mqa_single_device(
           mask,
+          segment_mask_function=segment_mask_function,
           block_sizes=block_sizes,
           save_residuals=True,
           attn_logits_soft_cap=attn_logits_soft_cap,
           interpret=self.INTERPRET,
       )
     else:
-      attn_ref = splash.make_masked_mha_reference(mask)
+      attn_ref = splash.make_masked_mha_reference(mask, segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mha_single_device(
           mask,
+          segment_mask_function=segment_mask_function,
           block_sizes=block_sizes,
           save_residuals=True,
           attn_logits_soft_cap=attn_logits_soft_cap,
@@ -507,9 +525,12 @@ class SplashAttentionTest(PallasBaseTest):
     k = random.uniform(k2, (kv_seq_len, head_dim_qk), dtype=dtype)
     v = random.uniform(k3, (kv_seq_len, head_dim_v), dtype=dtype)
     segment_ids = None
+    segment_mask_function = None
     if is_segmented:
       assert q_seq_len == kv_seq_len
       segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+      segment_mask_function = data.draw(segment_mask_function_strategy(jnp.max(segment_ids.q)))
+
     masks = data.draw(mha_mask_strategy(q_seq_len, kv_seq_len, 1))
     mask = jnp.array(masks[0].get_mask()[:, :])
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy(),
@@ -612,9 +633,12 @@ class SplashAttentionTest(PallasBaseTest):
       )
 
     segment_ids = None
+    segment_mask_function = None
     if is_segmented:
       assert q_seq_len == kv_seq_len
       segment_ids = data.draw(segment_ids_strategy(q_seq_len))
+      segment_mask_function = data.draw(segment_mask_function_strategy(jnp.max(segment_ids.q)))
+
     attn_logits_soft_cap = data.draw(attn_logits_soft_cap_strategy())
     masks = data.draw(mha_mask_strategy(q_seq_len, kv_seq_len, num_q_heads))
     mask = mask_lib.MultiHeadMask(tuple(m.get_mask() for m in masks))
@@ -625,21 +649,23 @@ class SplashAttentionTest(PallasBaseTest):
                             use_fused_bwd_kernel=use_fused_bwd_kernel)
     )
     if is_mqa:
-      attn_ref = splash.make_masked_mqa_reference(mask, backward_impl="custom")
+      attn_ref = splash.make_masked_mqa_reference(mask, backward_impl="custom", segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mqa_single_device(
           mask,
           block_sizes=block_sizes,
           downcast_smem_data=downcast_smem_data,
           attn_logits_soft_cap=attn_logits_soft_cap,
+          segment_mask_function=segment_mask_function,
           interpret=self.INTERPRET,
       )
     else:
-      attn_ref = splash.make_masked_mha_reference(mask, backward_impl="custom")
+      attn_ref = splash.make_masked_mha_reference(mask, backward_impl="custom", segment_mask_function=segment_mask_function)
       attn = splash.make_splash_mha_single_device(
           mask,
           block_sizes=block_sizes,
           downcast_smem_data=downcast_smem_data,
           attn_logits_soft_cap=attn_logits_soft_cap,
+          segment_mask_function=segment_mask_function,
           interpret=self.INTERPRET,
       )
     o, attn_vjp = jax.vjp(attn, q, k, v, segment_ids)
@@ -662,6 +688,7 @@ class SplashAttentionTest(PallasBaseTest):
         mask, q, k, v, segment_ids, o, logsumexp, do
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
       _, dq, dk, dv, _ = splash._attention_reference_custom_bwd(
+          segment_mask_function,
           splash.DEFAULT_MASK_VALUE,
           False,
           "flash",

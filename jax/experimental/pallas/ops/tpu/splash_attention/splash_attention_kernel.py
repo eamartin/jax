@@ -67,6 +67,12 @@ class SegmentIds(NamedTuple):
   kv: jax.Array  # [kv_seq_len]
 
 
+SegmentMaskFunctionType = Callable[[int, int], bool]
+
+def segment_equality(q_seg: int, kv_seg: int) -> bool:
+  return q_seg == kv_seg
+
+
 # Return type of SplashAttention function that implements the custom vjp rule.
 SplashCustomReturnType = Union[
     # out, no residuals
@@ -122,6 +128,7 @@ def _attention_reference(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None,
+    segment_mask_function: SegmentMaskFunctionType,
     save_residuals: Literal[False],
     mask_value: float,
     custom_type: str,
@@ -137,6 +144,7 @@ def _attention_reference(
     k: jax.Array,
     v: jax.Array,
     segment_ids: SegmentIds | None,
+    segment_mask_function: SegmentMaskFunctionType,
     save_residuals: Literal[True],
     mask_value: float,
     custom_type: str,
@@ -151,6 +159,7 @@ def _attention_reference(
     k: jax.Array,  # [kv_seq_len, head_dim]
     v: jax.Array,  # [kv_seq_len, head_dim]
     segment_ids: SegmentIds | None,
+    segment_mask_function: SegmentMaskFunctionType,
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
@@ -162,6 +171,7 @@ def _attention_reference(
       k,
       v,
       segment_ids,
+      segment_mask_function,
       mask_value,
       save_residuals,
       custom_type,
@@ -175,6 +185,7 @@ def _attention_reference_default(
     k: jax.Array,  # [kv_seq_len, head_dim]
     v: jax.Array,  # [kv_seq_len, head_dim]
     segment_ids: SegmentIds | None,
+    segment_mask_function: SegmentMaskFunctionType,
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
@@ -185,7 +196,7 @@ def _attention_reference_default(
 
   if segment_ids is not None:
     mask = jnp.logical_and(
-        mask, segment_ids.q[:, None] == segment_ids.kv[None, :]
+        mask, segment_mask_function(segment_ids.q[:, None], segment_ids.kv[None, :])
     )
 
   if attn_logits_soft_cap is not None:
@@ -213,6 +224,7 @@ def attention_reference(
     v: jax.Array,  # [kv_seq_len, head_dim]
     segment_ids: SegmentIds | None,
     *,
+    segment_mask_function: SegmentMaskFunctionType = segment_equality,
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     custom_type: str = "flash",
@@ -224,6 +236,7 @@ def attention_reference(
       k,
       v,
       segment_ids,
+      segment_mask_function=segment_mask_function,
       mask_value=mask_value,
       save_residuals=save_residuals,
       custom_type=custom_type,
@@ -237,6 +250,7 @@ def _attention_reference_custom_fwd(
     k: jax.Array,  # [kv_seq_len, head_dim]
     v: jax.Array,  # [kv_seq_len, head_dim]
     segment_ids: SegmentIds | None,
+    segment_mask_function: SegmentMaskFunctionType,
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
@@ -251,6 +265,7 @@ def _attention_reference_custom_fwd(
       k,
       v,
       segment_ids,
+      segment_mask_function=segment_mask_function,
       mask_value=mask_value,
       save_residuals=True,
       custom_type=custom_type,
@@ -260,6 +275,7 @@ def _attention_reference_custom_fwd(
 
 
 def _attention_reference_custom_bwd(
+    segment_mask_function: SegmentMaskFunctionType,
     mask_value: float,
     save_residuals: bool,
     custom_type: str,
@@ -281,7 +297,7 @@ def _attention_reference_custom_bwd(
 
   if segment_ids is not None:
     mask = jnp.logical_and(
-        mask, segment_ids.q[:, None] == segment_ids.kv[None, :]
+        mask, segment_mask_function(segment_ids.q[:, None], segment_ids.kv[None, :])
     )
   logits = jnp.where(mask, logits, mask_value)
 
@@ -310,7 +326,7 @@ def _attention_reference_custom_bwd(
 
 
 _attention_reference_custom = jax.custom_vjp(
-    _attention_reference, nondiff_argnums=(5, 6, 7, 8)
+    _attention_reference, nondiff_argnums=(5, 6, 7, 8, 9)
 )
 _attention_reference_custom.defvjp(_attention_reference_custom_fwd,
                                    _attention_reference_custom_bwd)
@@ -323,6 +339,7 @@ def attention_reference_custom(
     v: jax.Array,  # [kv_seq_len, head_dim]
     segment_ids: SegmentIds | None,
     *,
+    segment_mask_function: SegmentMaskFunctionType = segment_equality,
     mask_value: float = DEFAULT_MASK_VALUE,
     save_residuals: bool = False,
     custom_type: str = "flash",
@@ -334,6 +351,7 @@ def attention_reference_custom(
       k,
       v,
       segment_ids,
+      segment_mask_function,
       mask_value,
       save_residuals,
       custom_type=custom_type,
@@ -344,9 +362,13 @@ def attention_reference_custom(
 def make_attention_reference(
     mask: mask_lib.Mask | np.ndarray,
     is_mqa: bool,
+    segment_mask_function: SegmentMaskFunctionType | None = None,
     backward_impl: str = "vanilla",
     **params: Any,
 ) -> Callable:
+  if segment_mask_function is None:
+    segment_mask_function = segment_equality
+
   @partial(
       jax.jit,
       static_argnames=[
@@ -381,6 +403,7 @@ def make_attention_reference(
         mask_value=mask_value,
         save_residuals=save_residuals,
         attn_logits_soft_cap=attn_logits_soft_cap,
+        segment_mask_function=segment_mask_function,
         **params,
     )
 
@@ -590,6 +613,7 @@ def _apply_mask_and_soft_cap(
     k_slice: pl.Slice,
     k_offset: int | jax.Array,
     bq: int,
+    segment_mask_function: SegmentMaskFunctionType,
     k_in_lanes=True,
     mask_function=None,
 ) -> jax.Array | tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -658,7 +682,7 @@ def _apply_mask_and_soft_cap(
           kv_segment_ids_ref[k_slice, :], repeats, axis=1
       )  # [k_slice, bq]
       q_ids = q_segment_ids_ref[:1, :]  # [1, bq]
-    masks.append(q_ids == kv_ids)
+    masks.append(segment_mask_function(q_ids, kv_ids))
 
   def cap_logits(logits):
     if attn_logits_soft_cap is not None:
@@ -707,6 +731,7 @@ def flash_attention_kernel(
     v_layout: QKVLayout,
     attn_logits_soft_cap: float | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
 ):
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -767,6 +792,7 @@ def flash_attention_kernel(
         k_offset=global_kv_index * bkv + kv_compute_index * bkv_compute,
         bq=bq,
         mask_function=mask_function,
+        segment_mask_function=segment_mask_function,
     )
 
     qk = apply_mask_and_soft_cap()
@@ -839,6 +865,7 @@ def _splash_attention_forward(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     save_residuals: Literal[False] = False,
     attn_logits_soft_cap: float | None = None,
 ) -> jax.Array:
@@ -857,6 +884,7 @@ def _splash_attention_forward(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     save_residuals: Literal[True],
     attn_logits_soft_cap: float | None = None,
 ) -> SplashCustomReturnType:
@@ -882,6 +910,7 @@ def _splash_attention_forward(
     residual_checkpoint_name: str | None,
     save_residuals: bool,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     attn_logits_soft_cap: float | None = None,
     interpret: bool = False
 ) -> SplashCustomReturnType:
@@ -1111,6 +1140,7 @@ def _splash_attention_forward(
             v_layout=v_layout,
             attn_logits_soft_cap=attn_logits_soft_cap,
             mask_function=mask_function,
+            segment_mask_function=segment_mask_function,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=num_scalar_prefetch,
@@ -1160,7 +1190,7 @@ def _splash_attention_forward(
   return out
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14))
+@partial(jax.custom_vjp, nondiff_argnums=(7, 8, 9, 10, 11, 12, 13, 14, 15))
 def _splash_attention_custom(
     fwd_mask_info: mask_info_lib.MaskInfo,
     dq_mask_info: mask_info_lib.MaskInfo | None,
@@ -1175,6 +1205,7 @@ def _splash_attention_custom(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     attn_logits_soft_cap: float | None = None,
     interpret: bool = False,
 ) -> SplashCustomReturnType:
@@ -1201,6 +1232,7 @@ def _splash_attention_custom(
       residual_checkpoint_name=residual_checkpoint_name,
       save_residuals=save_residuals,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
       attn_logits_soft_cap=attn_logits_soft_cap,
       interpret=interpret,
   )
@@ -1220,6 +1252,7 @@ def _splash_attention_fwd(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     attn_logits_soft_cap: float | None = None,
     interpret: bool = False,
 ) -> tuple[
@@ -1241,6 +1274,7 @@ def _splash_attention_fwd(
       residual_checkpoint_name=residual_checkpoint_name,
       save_residuals=True,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
       attn_logits_soft_cap=attn_logits_soft_cap,
       interpret=interpret,
   )
@@ -1285,6 +1319,7 @@ def _flash_attention_dq_kernel(
     k_layout: QKVLayout,
     v_layout: QKVLayout,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
 ):
   float32 = jnp.float32
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
@@ -1327,6 +1362,7 @@ def _flash_attention_dq_kernel(
         k_offset=global_kv_index * bkv,
         bq=bq,
         mask_function=mask_function,
+        segment_mask_function=segment_mask_function,
     )
     p = jnp.exp(qk - logsumexp)
     dp_dims = NT_DIM_NUMBERS if v_layout == HEAD_DIM_MINOR else NN_DIM_NUMBERS
@@ -1371,6 +1407,7 @@ def _splash_attention_bwd_dq(
     k_layout: QKVLayout,
     v_layout: QKVLayout,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     interpret: bool,
 ):
   num_q_heads, q_seq_len, head_dim_qk = q.shape
@@ -1551,6 +1588,7 @@ def _splash_attention_bwd_dq(
       k_layout=k_layout,
       v_layout=v_layout,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
   )
   num_scalar_prefetch = 3
 
@@ -1637,6 +1675,7 @@ def _flash_attention_dkv_kernel(
     v_layout: QKVLayout,
     bkv: int,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
 ):
   HEAD_DIM_MINOR = QKVLayout.HEAD_DIM_MINOR
   kv_index, q_head_index, q_index = (
@@ -1715,6 +1754,7 @@ def _flash_attention_dkv_kernel(
         bq=bq,
         k_in_lanes=False,
         mask_function=mask_function,
+        segment_mask_function=segment_mask_function,
     )
     p = jnp.exp(qk - logsumexp)
     dv = lax.dot(p.astype(do.dtype), do, preferred_element_type=jnp.float32)
@@ -1807,6 +1847,7 @@ def _splash_attention_bwd_dkv(
     k_layout: QKVLayout,
     v_layout: QKVLayout,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     interpret: bool,
 ):
   num_q_heads, q_seq_len, head_dim_qk = q.shape
@@ -2094,6 +2135,7 @@ def _splash_attention_bwd_dkv(
       v_layout=v_layout,
       bkv=bkv,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
   )
   num_scalar_prefetch = 3
 
@@ -2162,6 +2204,7 @@ def _splash_attention_bwd(
     block_sizes: BlockSizes,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     attn_logits_soft_cap: float | None,
     interpret: bool,
     res: SplashResidualsType,
@@ -2218,6 +2261,7 @@ def _splash_attention_bwd(
       k_layout=block_sizes.k_layout,
       v_layout=block_sizes.v_layout,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
       interpret=interpret,
   )
   if not use_fused_bwd_kernel:
@@ -2240,6 +2284,7 @@ def _splash_attention_bwd(
         k_layout=block_sizes.k_layout,
         v_layout=block_sizes.v_layout,
         mask_function=mask_function,
+        segment_mask_function=segment_mask_function,
         interpret=interpret,
     )
   # Match the signature of the fwd function.
@@ -2268,6 +2313,7 @@ _splash_attention_custom.defvjp(_splash_attention_fwd, _splash_attention_bwd)
         "attn_logits_soft_cap",
         "residual_checkpoint_name",
         "mask_function",
+        "segment_mask_function",
         "interpret",
     ],
 )
@@ -2287,6 +2333,7 @@ def _splash_attention(
     attn_logits_soft_cap: float | None,
     residual_checkpoint_name: str | None,
     mask_function: MaskFunctionType | None,
+    segment_mask_function: SegmentMaskFunctionType,
     interpret: bool,
 ) -> SplashCustomReturnType:
   """
@@ -2324,6 +2371,7 @@ def _splash_attention(
       attn_logits_soft_cap=attn_logits_soft_cap,
       residual_checkpoint_name=residual_checkpoint_name,
       mask_function=mask_function,
+      segment_mask_function=segment_mask_function,
       interpret=interpret,
   )
 
@@ -2425,6 +2473,7 @@ def _make_splash_attention(
     block_sizes: BlockSizes | None = None,
     is_mqa: bool,
     save_residuals: bool = False,
+    segment_mask_function: SegmentMaskFunctionType | None = None,
     mask_value: float = DEFAULT_MASK_VALUE,
     attn_logits_soft_cap: float | None = None,
     downcast_smem_data: bool = True,
@@ -2440,6 +2489,9 @@ def _make_splash_attention(
     mask = mask_lib.MultiHeadMask(
         [mask_lib.NumpyMask(head_mask) for head_mask in mask]
     )
+
+  if segment_mask_function is None:
+    segment_mask_function = segment_equality
 
   if block_sizes is None:
     block_sizes = BlockSizes.get_default()
@@ -2505,6 +2557,7 @@ def _make_splash_attention(
       attn_logits_soft_cap=attn_logits_soft_cap,
       residual_checkpoint_name=residual_checkpoint_name,
       mask_function=mask_function_fwd,
+      segment_mask_function=segment_mask_function,
       interpret=interpret,
   )
 
